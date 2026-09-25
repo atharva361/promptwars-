@@ -1,0 +1,6 @@
+{
+  "name": "LexRoad - Road Accident Legal & Insurance Emergency AI Navigator",
+  "description": "Immediate legal guidance, evidence collection checklists, insurance claim procedures, and official assistance support for road accident incidents.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
