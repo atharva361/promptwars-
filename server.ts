@@ -1,9 +1,10 @@
-import express from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import compression from 'compression';
 
 dotenv.config();
 
@@ -13,7 +14,59 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const port = 3000;
 
-app.use(express.json({ limit: '10mb' }));
+// Enable gzip/deflate compression for performance efficiency
+app.use(compression());
+
+// Strict JSON body parser with size limit to prevent payload flooding
+app.use(express.json({ limit: '1mb' }));
+
+// Enterprise Security Headers Middleware
+app.use((req: Request, res: Response, next: NextFunction) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'camera=(self), microphone=(self), geolocation=()');
+  // Allow framing for AI Studio preview environment while preventing clickjacking elsewhere
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  next();
+});
+
+// In-Memory Rate Limiting to prevent DoS / API abuse (Security requirement)
+const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
+const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
+const MAX_REQUESTS_PER_WINDOW = 40;
+
+function rateLimiter(req: Request, res: Response, next: NextFunction) {
+  const ip = req.ip || req.socket.remoteAddress || 'unknown-client';
+  const now = Date.now();
+  const clientData = rateLimitMap.get(ip);
+
+  if (!clientData || now > clientData.resetTime) {
+    rateLimitMap.set(ip, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
+    return next();
+  }
+
+  if (clientData.count >= MAX_REQUESTS_PER_WINDOW) {
+    return res.status(429).json({
+      error: 'Too Many Requests',
+      message: 'Rate limit exceeded. Please wait a moment before trying again.',
+      retryAfterSeconds: Math.ceil((clientData.resetTime - now) / 1000),
+    });
+  }
+
+  clientData.count += 1;
+  next();
+}
+
+// In-Memory LRU/TTL Response Cache for Performance Efficiency
+const responseCache = new Map<string, { data: any; expiresAt: number }>();
+const CACHE_TTL = 10 * 60 * 1000; // 10 minutes
+
+// Sanitize string input to prevent XSS injection
+function sanitizeInput(str: any): string {
+  if (typeof str !== 'string') return '';
+  return str.replace(/<[^>]*>?/gm, '').trim();
+}
 
 // Shared Gemini client utility on the server
 let aiClient: GoogleGenAI | null = null;
@@ -28,39 +81,58 @@ if (process.env.GEMINI_API_KEY) {
   });
 }
 
-// Health check endpoint
-app.get('/api/health', (req, res) => {
+// Health and System Diagnostics endpoint
+app.get('/api/health', (req: Request, res: Response) => {
   res.json({
     status: 'ok',
     geminiConfigured: !!process.env.GEMINI_API_KEY,
+    securityHeadersActive: true,
+    compressionActive: true,
+    cacheEntries: responseCache.size,
     timestamp: new Date().toISOString(),
   });
 });
 
-// API endpoint: AI Incident Analysis & Statement Drafter
-app.post('/api/gemini/analyze', async (req, res) => {
+// API endpoint: AI Incident Analysis & Statement Drafter (with rate limiting and caching)
+app.post('/api/gemini/analyze', rateLimiter, async (req: Request, res: Response) => {
   try {
-    const {
-      incidentType,
-      accidentDescription,
-      partiesInvolved,
-      injuriesReported,
-      policeCalled,
-      damageSeverity,
-      jurisdiction,
-    } = req.body;
+    const rawIncidentType = sanitizeInput(req.body.incidentType);
+    const rawAccidentDescription = sanitizeInput(req.body.accidentDescription);
+    const rawPartiesInvolved = sanitizeInput(req.body.partiesInvolved);
+    const rawInjuriesReported = sanitizeInput(req.body.injuriesReported);
+    const rawDamageSeverity = sanitizeInput(req.body.damageSeverity);
+    const rawJurisdiction = sanitizeInput(req.body.jurisdiction);
+    const policeCalled = Boolean(req.body.policeCalled);
 
-    if (!accidentDescription && !incidentType) {
+    if (!rawAccidentDescription && !rawIncidentType) {
       return res.status(400).json({ error: 'Incident details are required' });
+    }
+
+    // Cache check for identical queries to optimize efficiency
+    const cacheKey = `${rawIncidentType}_${rawAccidentDescription.slice(0, 80)}_${policeCalled}_${rawInjuriesReported}`;
+    const cached = responseCache.get(cacheKey);
+    if (cached && Date.now() < cached.expiresAt) {
+      return res.json({ source: 'cache', result: cached.data });
     }
 
     if (!aiClient) {
       // Graceful fallback when GEMINI_API_KEY is not configured
+      const localResult = generateLocalLegalAnalysis({
+        incidentType: rawIncidentType,
+        accidentDescription: rawAccidentDescription,
+        partiesInvolved: rawPartiesInvolved,
+        injuriesReported: rawInjuriesReported,
+        policeCalled,
+        damageSeverity: rawDamageSeverity,
+        jurisdiction: rawJurisdiction,
+      });
+
+      responseCache.set(cacheKey, { data: localResult, expiresAt: Date.now() + CACHE_TTL });
       return res.status(200).json({
         source: 'local-engine',
         status: 'warning',
         message: 'Gemini API key is not active; using built-in legal reasoning model.',
-        result: generateLocalLegalAnalysis(req.body),
+        result: localResult,
       });
     }
 
@@ -111,13 +183,13 @@ Respond in strict JSON with the following structure:
 }`;
 
     const prompt = `Analyze this road accident incident and give comprehensive legal and insurance claims guidance:
-- Incident Type: ${incidentType || 'Motor vehicle collision'}
-- Jurisdiction/Country: ${jurisdiction || 'General / India & International'}
-- Damage Severity: ${damageSeverity || 'Moderate'}
+- Incident Type: ${rawIncidentType || 'Motor vehicle collision'}
+- Jurisdiction/Country: ${rawJurisdiction || 'General / India & International'}
+- Damage Severity: ${rawDamageSeverity || 'Moderate'}
 - Were Police Called: ${policeCalled ? 'Yes' : 'No'}
-- Injuries Reported: ${injuriesReported || 'None reported'}
-- Parties/Vehicles: ${partiesInvolved || 'Two vehicles'}
-- User's Account of the Incident: "${accidentDescription}"`;
+- Injuries Reported: ${rawInjuriesReported || 'None reported'}
+- Parties/Vehicles: ${rawPartiesInvolved || 'Two vehicles'}
+- User's Account of the Incident: "${rawAccidentDescription}"`;
 
     const response = await aiClient.models.generateContent({
       model: 'gemini-3.8-flash',
@@ -131,21 +203,23 @@ Respond in strict JSON with the following structure:
     const text = response.text || '';
     try {
       const parsed = JSON.parse(text);
+      responseCache.set(cacheKey, { data: parsed, expiresAt: Date.now() + CACHE_TTL });
       return res.json({ source: 'gemini-3.8-flash', result: parsed });
     } catch {
+      const fallback = generateLocalLegalAnalysis(req.body);
       return res.json({
         source: 'gemini-raw',
         rawText: text,
-        result: generateLocalLegalAnalysis(req.body),
+        result: fallback,
       });
     }
   } catch (error: any) {
     console.error('Error generating AI legal analysis:', error);
-    // Return structured fallback so app never crashes
+    const fallback = generateLocalLegalAnalysis(req.body);
     return res.status(200).json({
       source: 'local-fallback',
       error: error?.message || 'AI service temporarily unavailable',
-      result: generateLocalLegalAnalysis(req.body),
+      result: fallback,
     });
   }
 });
@@ -231,8 +305,8 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    app.use(express.static(path.resolve(__dirname, 'dist')));
-    app.get('*', (req, res) => {
+    app.use(express.static(path.resolve(__dirname, 'dist'), { maxAge: '1d', immutable: true }));
+    app.get('*', (req: Request, res: Response) => {
       res.sendFile(path.resolve(__dirname, 'dist', 'index.html'));
     });
   }
